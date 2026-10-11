@@ -1,0 +1,48 @@
+{
+  "timezone": "America/New_York",
+  "year": 2026,
+  "priorities": [
+    "all-three",
+    "two",
+    "one"
+  ],
+  "days": [
+    {
+      "date": "2026-11-24",
+      "park": "Hollywood Studios",
+      "anchors": [
+        "Fantasmic! nighttime show"
+      ]
+    },
+    {
+      "date": "2026-11-25",
+      "park": "Animal Kingdom",
+      "anchors": [
+        "Early hotel/pool evening"
+      ]
+    },
+    {
+      "date": "2026-11-26",
+      "park": "Magic Kingdom",
+      "anchors": [
+        "Fireworks"
+      ]
+    },
+    {
+      "date": "2026-11-27",
+      "park": "Magic Kingdom",
+      "anchors": [
+        "Bibbidi Bobbidi Boutique",
+        "Cinderella's Royal Table dinner",
+        "Early hotel evening"
+      ]
+    },
+    {
+      "date": "2026-11-28",
+      "park": "EPCOT",
+      "anchors": [
+        "Festival of the Holidays"
+      ]
+    }
+  ]
+}
