@@ -3,7 +3,7 @@ const annualHistory={};
 const category=r=>(r.Category||r['Transcription note']||'Uncategorized').trim();
 function renderCategories(limits={}) {
   el('categoryLimits').replaceChildren();
-  const parkRows=rows.filter(r=>r.Park===plan.days[day].park);
+  const parkRows=typeof activityCatalog==='function'?Object.values(activityCatalog()).map(a=>({Category:a.category})):rows.filter(r=>r.Park===plan.days[day].park);
   for(const name of [...new Set(parkRows.map(category))].sort()) {
     const label=document.createElement('label');label.textContent=`${name} (${parkRows.filter(r=>category(r)===name).length} available)`;
     const input=document.createElement('input');input.type='number';input.min='0';input.step='1';input.placeholder='Unlimited';input.dataset.category=name;input.value=limits[name]??'';
@@ -33,41 +33,8 @@ function daySections() {
   const points=[...new Set([start,end,...extra,...blocks.flatMap(b=>[b.start,b.end])])].sort((a,b)=>a-b);
   return points.slice(0,-1).map((start,i)=>({start,end:points[i+1],fixed:blocks.find(b=>start>=b.start&&start<b.end)}));
 }
-function renderSegments() {
-  try {
-    const sections=daySections(),limits=readCategoryLimits(),parkRows=rows.filter(r=>r.Park===plan.days[day].park).sort((a,b)=>votes(b)-votes(a)||a.Experience.localeCompare(b.Experience));
-    el('segments').replaceChildren();const counts={},chosen=new Set(),issues=[];
-    for(const section of sections) {
-      const box=document.createElement('div');box.className='segment';const heading=document.createElement('h3');heading.textContent=`${clock(section.start)}–${clock(section.end)}`+(section.fixed?' · '+section.fixed.name:'');box.append(heading);
-      if(!section.fixed) {
-        const key=`${section.start}-${section.end}`,selected=manualSelections[key]||[''];let cursor=section.start;
-        selected.forEach((name,index)=>{
-          const line=document.createElement('div'),select=document.createElement('select');select.setAttribute('aria-label',`${clock(section.start)} selection ${index+1}`);
-          select.append(new Option('Choose an experience…',''));
-          parkRows.forEach(r=>{const option=new Option(`${r.Experience} · ${category(r)} · ${votes(r)} family votes`,r.Experience);option.disabled=limits[category(r)]===0&&name!==r.Experience;select.append(option);});select.value=name;
-          select.onchange=()=>{manualSelections[key]=[...selected];manualSelections[key][index]=select.value;settings();renderSegments();};line.append(select);
-          const printable=document.createElement('span');printable.className='print-choice';printable.textContent=name||'Open time';line.append(printable);
-          if(name) {
-            const r=parkRows.find(r=>r.Experience===name);
-            if(!r){issues.push(name+' is no longer in the CSV.');return;}
-            const cat=category(r);counts[cat]=(counts[cat]||0)+1;if(chosen.has(name))issues.push(name+' selected more than once.');chosen.add(name);
-            if(counts[cat]>(limits[cat]??Infinity))issues.push(cat+' exceeds its daily maximum.');
-            const height=el('height').value,required=parseFloat(r['Min height (in)']);if(height!==''&&Number.isFinite(required)&&required>+height)issues.push(name+' exceeds the selected rider height.');
-            const estimate=(profiles[resolve(r)?.id]||[]).find(p=>p.hour===Math.floor((cursor+ +el('walk').value)/60));
-            const detail=document.createElement('small');detail.textContent=estimate?` · ${clock(cursor)} start · ~${estimate.median} min wait (${estimate.days} days)`:' · Wait unknown; confirm duration';line.append(detail);
-            cursor+= +el('walk').value+ +el('duration').value+(estimate?.median??0);
-            if(cursor>section.end)issues.push(`${clock(section.start)} section may run past its end.`);
-          }
-          const remove=document.createElement('button');remove.textContent='Remove';remove.onclick=()=>{manualSelections[key]=selected.filter((_,i)=>i!==index);settings();renderSegments();};line.append(remove);box.append(line);
-        });
-        const add=document.createElement('button');add.textContent='Add selection';add.onclick=()=>{manualSelections[key]=[...selected,''];settings();renderSegments();};box.append(add);
-      }el('segments').append(box);
-    }
-    const validKeys=new Set(sections.filter(s=>!s.fixed).map(s=>`${s.start}-${s.end}`));
-    if(Object.entries(manualSelections).some(([k,v])=>!validKeys.has(k)&&v.some(Boolean)))issues.push('Some saved selections belong to earlier time sections. Restore those time points to see them.');
-    el('selectionStatus').textContent=issues.length?[...new Set(issues)].join(' '):'Selections fit category limits. Check unknown waits, heights, and showtimes before finalizing.';
-  }catch(e){el('segments').replaceChildren();el('selectionStatus').textContent=e.message;}
-}
+function renderSegments() { renderCalendar(); }
+
 function shiftDate(date,days){const d=new Date(date+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+days);return d.toISOString().slice(0,10);}
 function thanksgiving(year){const d=new Date(Date.UTC(year,10,1));return `${year}-11-${String(1+(4-d.getUTCDay()+7)%7+21).padStart(2,'0')}`;}
 async function loadYearHistory() {

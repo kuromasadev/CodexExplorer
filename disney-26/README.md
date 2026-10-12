@@ -42,3 +42,15 @@ Validation: `node disney-26/analysis.test.js` and `node disney-26/planning.test.
 9. Add daily itinerary timeline, printable export, and offline caching.
 
 Implemented: live waits, monthly schedule lookup, backend history cache, comparable hourly windows, editable reservation blocks, height filter, daily draft itinerary and browser printing. Remaining: verified preferences/IDs, holiday-specific historical comparison, exact entertainment anchors, geographic walking estimates, rider swap, and offline support.
+
+## Activity catalog and calendar
+
+Run `python disney-26/extract_activities.py` to rebuild `activities.csv` from the four HTML files in `saved wdw`. The extractor reads the embedded `ng-state` JSON without executing page scripts or requesting websites. It filters by park, deduplicates website entity IDs, and includes all embedded listings rather than just the 20 rendered cards per page. Original HTML and preferences are preserved.
+
+The CSV contains activity names, Disney website IDs/URLs, thumbnail URLs and existing local image paths, readable tags, raw tag JSON, summaries, height tags, schedule dates, timezones, exact showtimes, raw schedule JSON and source HTML. It has 57 time columns from `08:00` through `22:00`. Values are `open`, `closed`, `opens:HH:MM`, `show:HH:MM`, or blank (not reported). Non-aligned performance starts are placed in the preceding quarter-hour column with the **exact** time in the cell; a 10:50 performance is `show:10:50` under `10:45`. Saved schedules are dated snapshots, not future confirmations.
+
+The daily calendar replaces section dropdowns. Drag cards from the searchable activity library onto an 8 AM–10 PM grid, or select a card and then a time using touch/keyboard. Drag an appointment to move it; edit its duration in multiples of 15 minutes or remove it. Calendar placement enforces visiting hours, reservation overlaps, other appointments, height requirements and daily category caps. Imported reservation details remain only in browser storage. Unknown reservation end times must be entered before scheduling that day. Duration estimates include walking, experience time and historical wait when available; unknown waits remain explicit.
+
+Website activities are linked to family preferences only by unique normalized names. Unmatched names remain available with zero known family votes and separate preference-only cards; ambiguous matches are not guessed. Calendar selections save per day and older dropdown selections migrate once. Changed constraints show conflicts without deleting saved appointments. Printing produces a chronological activity/reservation list instead of the scrolling calendar.
+
+Additional validation: `node disney-26/calendar.test.js` and `python disney-26/extract_activities_test.py`.

@@ -1,0 +1,15 @@
+const assert=require('node:assert/strict');const {place}=require('./calendar-core.js');
+const constraints={start:480,end:1320,blocks:[{start:800,end:860}],limits:{Ride:1},activities:{a:{category:'Ride',height:40},b:{category:'Ride'},c:{category:'Show'}},height:48};
+const item={id:'one',activity:'a',start:540,duration:45};
+assert.equal(place([],item,constraints)[0].start,540);
+assert.throws(()=>place([],{...item,start:541},constraints),/15-minute/);
+assert.throws(()=>place([],{...item,start:780},constraints),/overlaps/);
+assert.throws(()=>place([],{...item,start:1305},constraints),/visiting hours/);
+assert.throws(()=>place([item],{id:'two',activity:'b',start:600,duration:30},constraints),/maximum/);
+assert.throws(()=>place([item],{id:'two',activity:'c',start:555,duration:30},constraints),/overlaps/);
+assert.equal(place([item],{...item,start:600},constraints).length,1,'Moving an appointment replaces it');
+assert.throws(()=>place([],{...item}, {...constraints,height:35}),/height/);
+assert.throws(()=>place([],{...item,duration:20},constraints),/15-minute/);
+assert.throws(()=>place([],{...item}, {...constraints,limits:{Ride:0}}),/maximum/);
+assert.equal(place([],{...item,start:1275},constraints)[0].start,1275,'Appointment may end exactly at 10 PM');
+console.log('Calendar snapping, moves, overlaps, reservations, caps, height and closing boundary passed.');
