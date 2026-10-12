@@ -1,0 +1,11 @@
+@font-face {
+  font-family: "pepmdx";
+  src: url(../fonts/icons/pep_icon_font-webfont.woff2?version=2025.12.22) format("woff2"),
+    url(../fonts/icons/pep_icon_font-webfont.woff?version=2025.12.22) format("woff"),
+    url(../fonts/icons/pep_icon_font-webfont.ttf?version=2025.12.22) format("truetype"),
+    url(../fonts/icons/pep_icon_font-webfont.svg?version=2025.12.22) format("svg"),
+    url(../fonts/icons/pep_icon_font-webfont.eot?version=2025.12.22) format("embedded-opentype"),
+    url(../fonts/icons/pep_icon_font-webfont.otf?version=2025.12.22) format("opentype");
+  font-weight: normal;
+  font-style: normal;
+}

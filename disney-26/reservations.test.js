@@ -1,0 +1,14 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const storage=new Map();
+const context=vm.createContext({localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},document:{getElementById:()=>({})},plan:{days:[{date:'2030-01-01'}]},day:0,timeMinutes:value=>{if(!/^\d{2}:\d{2}$/.test(value))throw Error('Invalid time');const [h,m]=value.split(':').map(Number);if(h>23||m>59)throw Error('Invalid time');return h*60+m;}});
+vm.runInContext(fs.readFileSync(__dirname+'/reservations.js','utf8'),context);
+context.data=[{date:'2030-01-01',name:'Appointment',start:'10:00',end:null}];
+assert.equal(vm.runInContext('validateReservations(data)[0].end',context),null,'Import must not invent end times');
+storage.set('planner-reservations',JSON.stringify(context.data));
+assert.throws(()=>vm.runInContext('reservationBlocks()',context),/planning end/);
+context.data[0].end='11:00';storage.set('planner-reservations',JSON.stringify(context.data));
+assert.equal(vm.runInContext('reservationBlocks()[0].start',context),600);
+assert.equal(vm.runInContext('reservationBlocks()[0].end',context),660);
+context.data[0].end='09:00';assert.throws(()=>vm.runInContext('validateReservations(data)',context),/after/);
+context.data[0].date='2030-02-30';assert.throws(()=>vm.runInContext('validateReservations(data)',context),/date/);
+console.log('Reservation import validation, browser storage and unknown-end safeguards passed.');

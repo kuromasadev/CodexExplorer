@@ -26,7 +26,7 @@ function daySections() {
   const blocks=el('blocks').value.split('\n').filter(x=>x.trim()).map(line=>{
     const match=line.match(/^\s*(\d{2}:\d{2})-(\d{2}:\d{2})\s*\|\s*(.+)$/);if(!match)throw Error('Reservation format: 14:00-15:00 | Name');
     return {start:timeMinutes(match[1]),end:timeMinutes(match[2]),name:match[3]};
-  }).sort((a,b)=>a.start-b.start);
+  }).concat(reservationBlocks()).sort((a,b)=>a.start-b.start);
   blocks.forEach((b,i)=>{if(b.start<start||b.end>end||b.end<=b.start||(i&&blocks[i-1].end>b.start))throw Error('Reservations must fit inside your day and cannot overlap.');});
   const extra=el('timepoints').value.split(',').map(x=>x.trim()).filter(Boolean).map(timeMinutes);
   if(extra.some(t=>t<=start||t>=end))throw Error('Additional time points must fall between arrival and departure.');
@@ -66,7 +66,7 @@ function renderSegments() {
     const validKeys=new Set(sections.filter(s=>!s.fixed).map(s=>`${s.start}-${s.end}`));
     if(Object.entries(manualSelections).some(([k,v])=>!validKeys.has(k)&&v.some(Boolean)))issues.push('Some saved selections belong to earlier time sections. Restore those time points to see them.');
     el('selectionStatus').textContent=issues.length?[...new Set(issues)].join(' '):'Selections fit category limits. Check unknown waits, heights, and showtimes before finalizing.';
-  }catch(e){el('selectionStatus').textContent=e.message;}
+  }catch(e){el('segments').replaceChildren();el('selectionStatus').textContent=e.message;}
 }
 function shiftDate(date,days){const d=new Date(date+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+days);return d.toISOString().slice(0,10);}
 function thanksgiving(year){const d=new Date(Date.UTC(year,10,1));return `${year}-11-${String(1+(4-d.getUTCDay()+7)%7+21).padStart(2,'0')}`;}

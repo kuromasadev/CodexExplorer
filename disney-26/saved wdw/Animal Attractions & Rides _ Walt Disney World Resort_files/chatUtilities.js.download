@@ -1,0 +1,2046 @@
+/* =================================================================================== *
+ * Project      : Proactive Chat Invitations
+ * File         : ProactiveChat.js
+ * Description  : Bootstraps, caches, and drives the lifecycle for Disney’s
+ * MIAW proactive-chat experience:
+ * — Fetches & cached engagement data from Salesforce (Node proxy)
+ * — Refreshes cached information every 15 minutes
+ * — Raises events to Digital to show / hide the chat bubble
+ * — Listens for behavioural-event payloads from the Disney site
+ * — Sets pre-chat fields and launches chat when rules match
+ *
+ * Version      : 1.0.0
+ * Author       : ppremachandran@salesforce.com
+ * Created      : 2025-06-28
+ * Last Updated : 2025-07-17
+ *
+ * Changelog    :
+ * 1.0.0 – 2025-06-28 – Initial version
+ * 1.1.0 – 2025-07-17 – Added Visited Pages, Cart logic update on Messsages
+ * 1.2.0 – 2025-08-18 – Added Visited Pages Exclude, Cart Decrease by, 
+						Cart Abandonment scenarios
+ * 1.3.0 – 2025-08-25 – Added Time on Entry page scenario
+ * 1.4.0 – 2025-09-09 – Added Followup page tracking, Flow based Engagement logic, 
+						Order purchase logic
+ * 1.5.0 – 2025-09-17 – Increased visited pages caching beyond 10 URLs
+ * 1.6.0 – 2025-09-24 – Prevent API calls for - Cart(before & after conversation), 
+						Visited Page(after conversation), Order (before conversation)
+ * 1.7.0 - 2025-12-18 - LOB Included in Engagement Payload, 
+						Language Context switch	consideration (en_US to es_US & vice versa	
+ * 1.14.0 - 2026-01-21 - Adjusting cache clear logic to avoid unnecessary data fetches
+ * 1.15.0 - 2026-01-23 - Secure form fix
+ * 1.16.0 - 2026-02-04 - Add logger
+ * 1.17.0 - 2026-02-19 - Adding support for isOnlyForProactive flag in the cart information to avoid sending cart details to chat when not required
+ * 1.17.0 - 2026-02-19 - Add validation within the timeout to prevent the call from being made if the conversation ends during that time.
+ * 1.18.0 - 2026-03-05 - Add validation to avoid calling engagements service on DVC.
+ * 1.19.0 - 2026-03-11 - Send SWID with the Order Attribution payload.
+ * 1.20.0 - 2026-04-24 - Replace SF endpoints with ours.
+ * 1.21.0 - 2026-05-19 - Use AKAMI URL for unauthenticated engagements fetch. Increase the cache duration to 1 hour.
+ * 1.22.0 - 2026-05-26 - Avoid making requests to engagements from prohibited countries; we only use the AKAMI URL for engagements and no longer send the SWID in the request.
+ * 1.23.0 - 2026-05-29 - Fix periodic cache refresh calling handleProactiveInit without event; use initEngagementData directly.
+ * 1.24.0 - 2026-06-04 - Add onEmbeddedMessagingBusinessHoursUpdate event
+ * 1.25.0 - 2026-06-05 - Add timestamp-based cache expiration for engagement data to survive page reloads
+* =================================================================================== */
+
+// --- Global State Object ---
+const AppState = {
+	SWID: null,
+	BASE_API_URL: null,
+	GUEST_ENGAGEMENTS_URL: null,
+	CHAT_ENV: null,
+	ORG_BIZ_UNIT: null,
+	PLATFORM: null,
+	COUNTRY: null,
+	LANGUAGE: null,
+	LINE_OF_BUSINESS: null,
+	PROACTIVE_TIMER_ID: null,
+	TIME_ON_PAGE_TIMER: null,
+	FINAL_MATCHED_ENGAGEMENT: null,
+	CONVERSATION_ID: null,
+	CLOSE_SECS: 5,
+	FOLLOW_SECS: 30, //SPRINT 10
+	CHAT_HAS_ENDED: false, //SPRINT 12
+	IS_COVERSATION_STARTED: false, //SIT BUG FIX
+	DURING_BUSINESS_HOURS: true,
+	FLOWSTATE: {
+		//SPRINT 10
+		timerId: null,
+		startTime: null,
+		engagementId: null,
+	},
+};
+
+const ONE_HOUR_IN_MS = 60 * 60 * 1000;
+const allowedCountries = ["us", "ca"];
+const BRANDS_WITHOUT_ENGAGEMENT_INFO = ["DVC"];
+
+const isDebugActive = () => {
+	if (typeof window === "undefined") return false;
+
+	try {
+		const params = new URLSearchParams(window.location.search);
+		return (
+			params.get("chatDebug") === "true" ||
+			localStorage.getItem("chatDebug") === "true"
+		);
+	} catch (e) {
+		return false;
+	}
+};
+
+const proactiveInitDispatch = () => {
+	window.dispatchEvent(
+		new CustomEvent("onEmbeddedMessagingProactiveInitialized", {
+			detail: {
+				status: "SUCCESS",
+			},
+		})
+	);
+};
+
+const DEBUG_MODE = isDebugActive();
+
+const Logger = {
+	log: (...args) => {
+		if (DEBUG_MODE) console.log(...args);
+	},
+	warn: (...args) => {
+		if (DEBUG_MODE) console.warn(...args);
+	},
+	error: (...args) => {
+		if (DEBUG_MODE) console.error(...args);
+	},
+};
+
+//================================================================================
+// INITIALIZATION & EVENT LISTENERS
+//================================================================================
+
+/**
+ * Starting point of the interaction.
+ */
+window.addEventListener(
+	"onEmbeddedMessagingProactiveInit",
+	handleProactiveInit
+);
+
+/**
+ * Listens for business hours updates from the navigation UI.
+ * Updates AppState so proactive dialogs are suppressed outside business hours.
+ */
+window.addEventListener(
+	"onEmbeddedMessagingBusinessHoursUpdate",
+	function (event) {
+		if (event && event.detail) {
+			AppState.DURING_BUSINESS_HOURS =
+				event.detail.duringBusinessHours !== false;
+			Logger.log(
+				"Business hours updated:",
+				AppState.DURING_BUSINESS_HOURS
+			);
+		}
+	}
+);
+
+/**
+ * Handler function to capture initial details and start the data fetch.
+ */
+function handleProactiveInit(event) {
+	Logger.log("Embedded Messaging Proactive Init event received.");
+	if (event && event.detail) {
+		const {
+			SWID,
+			Organization,
+			Mobile_or_Desktop,
+			Country,
+			Language,
+			LineOfBusiness,
+			BaseApiUrl,
+			ChatEnvironment,
+			duringBusinessHours,
+		} = event.detail;
+
+		// Set business hours state from initial payload
+		if (duringBusinessHours !== undefined) {
+			AppState.DURING_BUSINESS_HOURS = duringBusinessHours !== false;
+			Logger.log("Business hours set from init:", AppState.DURING_BUSINESS_HOURS);
+		}
+
+		// 2. Create "Fingerprint" Strings for comparison
+		const newValuesString =
+			(SWID || "") +
+			(Organization || "") +
+			(Mobile_or_Desktop || "") +
+			(Country || "") +
+			(Language || "") +
+			(LineOfBusiness || "") +
+			(BaseApiUrl || "") +
+			(ChatEnvironment || "");
+
+		// 3. Retrieve the OLD fingerprint from localStorage
+		const oldValuesString = localStorage.getItem("ProactiveContextFingerprint");
+
+		// 5. Update AppState
+		AppState.SWID = SWID || null;
+		AppState.ORG_BIZ_UNIT = Organization || null;
+		AppState.PLATFORM = Mobile_or_Desktop || null;
+		AppState.COUNTRY = Country || null;
+		AppState.LANGUAGE = Language || null;
+		AppState.LINE_OF_BUSINESS = LineOfBusiness || null;
+		AppState.BASE_API_URL = BaseApiUrl ? `${BaseApiUrl}/chat/` : null;
+		AppState.GUEST_ENGAGEMENTS_URL = BaseApiUrl
+			? `${BaseApiUrl}/content/header/chat/`
+			: null;
+		AppState.CHAT_ENV = ChatEnvironment || null;
+
+		Logger.log("Proactive Chat Initialized with State:", AppState);
+		if (newValuesString !== oldValuesString) {
+			Logger.log(
+				"Context change detected (Fingerprint mismatch). Refreshing rules cache."
+			);
+			// Clear the old engagement data
+			clearCachedEngagementData(null, false);
+			// Update the persistent fingerprint
+			localStorage.setItem("ProactiveContextFingerprint", newValuesString);
+		} else {
+			Logger.log(
+				"Init event received but no state change detected. Skipping initialization."
+			);
+		}
+		// Always call initEngagementData - it checks cache internally and skips fetch if data exists
+		initEngagementData();
+	}
+}
+
+window.addEventListener(
+	"onEmbeddedMessagingProactiveDismissDialog",
+	preventDisneyProactiveDialog
+);
+
+async function preventDisneyProactiveDialog() {
+	// Stop the timer
+	if (AppState.PROACTIVE_TIMER_ID) clearTimeout(AppState.PROACTIVE_TIMER_ID);
+	// Hide the proactive dialog
+	window.dispatchEvent(
+		new CustomEvent("onEmbeddedMessagingProactiveHideDialog")
+	);
+	Logger.log("preventDisneyProactiveDialog dispatched");
+	// Set the below so that proactive chat dialog does not pop up again after user has dismissed it
+	sessionStorage.setItem("proactiveChatAlreadyInvokedOrDismissed", true);
+	localStorage.removeItem("proactiveFollowTimerExpiresAt");
+	localStorage.removeItem("activeProactiveEngagement");
+}
+
+/**
+ * A centralized async function to initialize engagement data.
+ */
+async function initEngagementData() {
+	const cacheSuffix = AppState.SWID ? "_Auth" : "";
+	const clearCacheStrategy = AppState.SWID ? "isSWID" : "noSWID";
+	const isContextSwitched =
+		(AppState.SWID && localStorage.getItem("EngagementGroup")) ||
+		(!AppState.SWID && localStorage.getItem("EngagementGroup_Auth"));
+
+	if (isContextSwitched) clearCachedEngagementData(clearCacheStrategy, false); //clear cache without refresh
+
+	// Check if cached data has expired (older than 1 hour)
+	try {
+		const cachedAtStr = localStorage.getItem("EngagementCachedAt");
+		if (cachedAtStr) {
+			const cachedAt = parseInt(cachedAtStr, 10);
+			if (isNaN(cachedAt) || Date.now() - cachedAt > ONE_HOUR_IN_MS) {
+				Logger.log("Engagement cache expired or corrupted. Clearing.");
+				clearCachedEngagementData(null, false);
+			}
+		}
+	} catch (e) {
+		Logger.warn("Failed to validate engagement cache timestamp. Clearing.", e);
+		clearCachedEngagementData(null, false);
+	}
+
+	// Get all keys from localStorage to find a potential match
+	const allLocalStorageKeys = Object.keys(localStorage);
+
+	// Check if we have a cached "empty" response (no engagements available)
+	const engagementGroupKey = `EngagementGroup${cacheSuffix}`;
+	const storedGroupRaw = localStorage.getItem(engagementGroupKey);
+	let isEmptyCached = false;
+	if (storedGroupRaw) {
+		try {
+			const storedGroup = JSON.parse(storedGroupRaw);
+			if (storedGroup && storedGroup.empty === true) {
+				isEmptyCached = true;
+			}
+		} catch (e) {
+			// Invalid JSON, treat as not cached
+		}
+	}
+
+	// Find all 'Engagement' keys that match the current auth state (e.g., ends with _Auth)
+	// We specifically exclude 'EngagementGroup' to focus on the main engagement item.
+	const engagementCacheKeys = allLocalStorageKeys.filter(
+		(key) => key.startsWith("Engagement") && !key.startsWith("EngagementGroup")
+	);
+
+	// Check if any of these found engagements represents a complete, cached set.
+	const isDataCached =
+		isEmptyCached ||
+		engagementCacheKeys.some((engagementKey) => {
+			// Extract the dynamic rank from the key using a regular expression.
+			// Key format: "Engagement{cacheSuffix}_{rank}" where cacheSuffix is "_Auth" or ""
+			// Examples:
+			//   Guest: "Engagement_1" -> rank = "1"
+			//   Auth:  "Engagement_Auth_1" -> rank = "1"
+			// We need to escape the cacheSuffix since it may contain special regex chars
+			const escapedSuffix = cacheSuffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const regex = new RegExp(`^Engagement${escapedSuffix}_(\\w+)$`);
+			const match = engagementKey.match(regex);
+			if (!match) return false;
+			const engagementRank = match[1];
+
+			// Now, check if all 4 corresponding keys for THIS SPECIFIC ID exist.
+			const requiredKeysForThisId = [
+				`EngagementGroup${cacheSuffix}`,
+				`Engagement${cacheSuffix}_${engagementRank}`,
+				`EntryPointPages${cacheSuffix}_${engagementRank}`,
+				`BehaviourTargetConditions${cacheSuffix}_${engagementRank}`,
+			];
+
+			return requiredKeysForThisId.every(
+				(k) => localStorage.getItem(k) !== null
+			);
+		});
+
+	if (isDataCached) {
+		Logger.log(
+			`Data already cached for ${AppState.SWID ? "authenticated" : "guest"
+			} user.`
+		);
+		proactiveInitDispatch();
+		return; // Exit the function since data is cached
+	}
+
+	Logger.log(
+		`No cached data for ${AppState.SWID ? "authenticated" : "guest"
+		} user. Fetching...`
+	);
+	try {
+		if (BRANDS_WITHOUT_ENGAGEMENT_INFO.includes(AppState.ORG_BIZ_UNIT)) {
+			Logger.log("Skipping engagementInfo fetch for this brand.");
+			proactiveInitDispatch();
+			return;
+		}
+		await fetchAndCacheEngagementData();
+		proactiveInitDispatch();
+	} catch (error) {
+		const userType = AppState.SWID ? "authenticated" : "guest";
+		Logger.error(`Initialization failed for ${userType} user:`, error);
+		window.dispatchEvent(
+			new CustomEvent("onEmbeddedMessagingProactiveInitialized", {
+				detail: {
+					status: "FAILURE",
+					message: error.message,
+				},
+			})
+		);
+	}
+}
+
+//================================================================================
+// CACHE & DATA MANAGEMENT
+//================================================================================
+function getAllCachedEngagementData() {
+	const suffix = AppState.SWID ? "_Auth" : "";
+	const finalEngagements = [];
+
+	const storedGroup = localStorage.getItem("EngagementGroup" + suffix);
+	const engagementGroup = storedGroup ? JSON.parse(storedGroup) : null;
+	if (!engagementGroup || !Array.isArray(engagementGroup.engagements)) {
+		Logger.warn("No EngagementGroup found in cache.");
+		return [];
+	}
+	const engagementsFromGroup = engagementGroup.engagements;
+
+	engagementsFromGroup.forEach((groupEngagement) => {
+		const rank = groupEngagement.ranking;
+		const engagementKey = `Engagement${suffix}_${rank}`;
+		const cachedEngagementStr = localStorage.getItem(engagementKey);
+
+		if (cachedEngagementStr) {
+			try {
+				const engagementObject = JSON.parse(cachedEngagementStr);
+				finalEngagements.push(engagementObject);
+			} catch (e) {
+				Logger.error(
+					`Failed to parse cached data for engagement with rank ${rank}.`,
+					e
+				);
+			}
+		}
+	});
+	finalEngagements.sort((a, b) => (a.ranking || 99) - (b.ranking || 99));
+
+	return finalEngagements;
+}
+
+/**
+ * Fetches engagement data from Salesforce and stores it in localStorage.
+ */
+let isFetchingEngagements = false;
+
+async function fetchAndCacheEngagementData() {
+	// Guard against concurrent fetches (e.g., race between timer and navigation)
+	if (isFetchingEngagements) {
+		Logger.log("Skipping fetch — another fetch is already in progress.");
+		return;
+	}
+	isFetchingEngagements = true;
+
+	if (
+		!AppState.BASE_API_URL ||
+		!AppState.CHAT_ENV ||
+		!AppState.ORG_BIZ_UNIT ||
+		!AppState.PLATFORM ||
+		!AppState.COUNTRY ||
+		!AppState.LANGUAGE ||
+		!AppState.LINE_OF_BUSINESS
+	) {
+		isFetchingEngagements = false;
+		throw new Error("Information incomplete. Cannot construct API endpoint.");
+	}
+	if (!allowedCountries.includes(AppState.COUNTRY.toLowerCase())) {
+		Logger.log("Engagements not allowed for country: " + AppState.COUNTRY);
+		isFetchingEngagements = false;
+		return;
+	}
+	const endpoint = `${AppState.GUEST_ENGAGEMENTS_URL
+		}engagements/?brand=${AppState.ORG_BIZ_UNIT.toLowerCase()}&env=${AppState.CHAT_ENV
+		}&platform=${AppState.PLATFORM}&country=${AppState.COUNTRY}&authenticated=${!!AppState.SWID ? "true" : "false"
+		}&language=${AppState.LANGUAGE}&lineOfBusiness=${AppState.LINE_OF_BUSINESS}`;
+
+	try {
+		const resp = await fetch(endpoint);
+
+		if (!resp.ok) {
+			throw new Error(`API Error: Status ${resp.status} ${resp.statusText}`);
+		}
+
+		const { engagementGroups } = await resp.json();
+		if (!Array.isArray(engagementGroups) || engagementGroups.length === 0) {
+			Logger.warn("No running EngagementGroup found.");
+			// Store a marker to indicate we checked and got empty response
+			// This prevents repeated fetches when there are no engagements
+			const suffix = AppState.SWID ? "_Auth" : "";
+			localStorage.setItem(
+				`EngagementGroup${suffix}`,
+				JSON.stringify({ empty: true, checkedAt: Date.now() })
+			);
+			localStorage.setItem("EngagementCachedAt", Date.now().toString());
+			return;
+		}
+
+		const suffix = AppState.SWID ? "_Auth" : "";
+
+		// Loop through each engagement group from the response
+		for (const group of engagementGroups) {
+			// Ensure the nested engagements array exists
+			if (Array.isArray(group.engagements)) {
+				// Loop through each engagement within the group
+				for (const engagement of group.engagements) {
+					// Use optional chaining for safety in case properties are missing
+					const pages = engagement.entryPointLibrary?.pages || [];
+					const conds = engagement.behaviorConditions || [];
+					const engagementId = engagement.id;
+					const engagementRank = engagement.ranking;
+
+					// Skip this engagement if it doesn't have an ID
+					if (!engagementId) {
+						Logger.warn(
+							"Found an engagement without an ID, skipping.",
+							engagement
+						);
+						continue;
+					}
+
+					// Create unique keys for each engagement using its ID
+					const itemsToCache = {
+						[`EngagementGroup${suffix}`]: group,
+						[`Engagement${suffix}_${engagementRank}`]: engagement,
+						[`EntryPointPages${suffix}_${engagementRank}`]: pages,
+						[`BehaviourTargetConditions${suffix}_${engagementRank}`]: conds,
+					};
+
+					Object.entries(itemsToCache).forEach(([key, value]) =>
+						localStorage.setItem(key, JSON.stringify(value))
+					);
+
+					Logger.log(
+						`Successfully cached data for engagement ID: ${engagementId}`
+					);
+				}
+			}
+		}
+
+		localStorage.setItem("EngagementCachedAt", Date.now().toString());
+		Logger.log("Finished fetching and caching all engagement data.");
+	} catch (err) {
+		Logger.error("Failed to fetch or cache engagement data:", err);
+		throw err; // Re-throw the error to be caught by initEngagementData
+	} finally {
+		isFetchingEngagements = false;
+	}
+}
+
+/**
+ * Step up scenario, when the user logs in during the chat for regular chat only
+ */
+window.addEventListener("onEmbeddedMessagingAuthentication", handleChatStepUp);
+
+async function handleChatStepUp(event) {
+	const detail = event?.detail;
+	const swid = detail?.swid;
+	const convId = detail?.conversationId || AppState.CONVERSATION_ID;
+	if (
+		!swid ||
+		!convId ||
+		!AppState.BASE_API_URL ||
+		!AppState.ORG_BIZ_UNIT ||
+		!AppState.CHAT_ENV
+	) {
+		Logger.error("handleChatStepUp is missing required event details.", {
+			swid,
+			convId,
+		});
+		throw new Error("Cannot proceed with chat step-up due to missing data.");
+	}
+
+	const endpoint = `${AppState.BASE_API_URL
+		}stepUp/?brand=${AppState.ORG_BIZ_UNIT.toLowerCase()}&env=${AppState.CHAT_ENV
+		}`;
+	const body = JSON.stringify({
+		conversationId: convId,
+	});
+
+	try {
+		const resp = await fetch(endpoint, {
+			method: "PUT",
+			headers: {
+				swid,
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body,
+		});
+
+		if (!resp.ok) {
+			//SPRINT 12 START - raise an event tp notify step up failure
+			window.dispatchEvent(
+				new CustomEvent("onEmbeddedMessagingAuthenticationStatus", {
+					detail: {
+						status: "FAILURE",
+						message: "Salesforce stepUp conversationService API failed",
+					},
+				})
+			);
+			Logger.warn("stepUp API failed!");
+			//SPRINT 12 END
+			throw new Error(`API Error: Status ${resp.status} ${resp.statusText}`);
+		}
+
+		const { success, message } = await resp.json();
+
+		if (success && message == "MessagingSession updated successfully.") {
+			Logger.log("MessagingSession updated successfully.");
+			window.dispatchEvent(
+				new CustomEvent("onEmbeddedMessagingAuthenticationStatus", {
+					detail: {
+						status: "SUCCESS",
+					},
+				})
+			);
+			return;
+		} else {
+			window.dispatchEvent(
+				new CustomEvent("onEmbeddedMessagingAuthenticationStatus", {
+					detail: {
+						status: "FAILURE",
+						message:
+							"Salesforce stepUp conversationService API returned an error",
+					},
+				})
+			);
+			Logger.warn("Failed to update MessagingSession for stepUp scenario.");
+		}
+	} catch (err) {
+		Logger.error("Failed to fetch or cache engagement data:", err);
+		window.dispatchEvent(
+			new CustomEvent("onEmbeddedMessagingAuthenticationStatus", {
+				detail: {
+					status: "FAILURE",
+					message: err.message,
+				},
+			})
+		);
+		throw err;
+	}
+}
+
+/**
+ * Clears all proactive chat engagement data from the cache.
+ */
+function clearCachedEngagementData(flag, isRefresh = true) {
+	const baseKeys = [
+		"EngagementGroup",
+		"Engagement",
+		"EntryPointPages",
+		"BehaviourTargetConditions",
+	];
+	const allLocalStorageKeys = Object.keys(localStorage);
+
+	// Loop through every single key currently in localStorage
+	allLocalStorageKeys.forEach((key) => {
+		// Check if the current key from storage starts with any of the target base keys
+		const isTargetKey = baseKeys.some((baseKey) => key.startsWith(baseKey));
+
+		// if not a match, skip to the next one
+		if (!isTargetKey) {
+			return;
+		}
+
+		const isAuthKey = key.includes("_Auth");
+
+		// Now that we have a match, apply the logic based on the flag
+		switch (flag) {
+			case "isSWID":
+				// If SWID is present, clear only the standard (non-Auth) data.
+				if (!isAuthKey) {
+					localStorage.removeItem(key);
+				}
+				break;
+
+			case "noSWID":
+				// If SWID is absent, clear only the authenticated (_Auth) data.
+				if (isAuthKey) {
+					localStorage.removeItem(key);
+				}
+				break;
+
+			default:
+				// By default, clear all matching engagement data, regardless of suffix.
+				localStorage.removeItem(key);
+				break;
+		}
+	});
+
+	Logger.log("Cleared cached engagement data.");
+
+	// clear the ProactiveContextFingerprint only
+	// when the 1 hour timer expires OR when the init event context changes
+	if (!flag) {
+		localStorage.removeItem("ProactiveContextFingerprint");
+	}
+	localStorage.removeItem("EngagementCachedAt");
+
+	// Re-fetch engagement data using the context already stored in AppState.
+	if (isRefresh) {
+		initEngagementData();
+		Logger.log("Fetching Again from Server");
+	}
+}
+
+
+//================================================================================
+// BEHAVIOURAL & MATCHING LOGIC
+//================================================================================
+
+/**
+ * Listens for client-side behavioural events.
+ */
+window.addEventListener(
+	"onEmbeddedMessagingProactiveListener",
+	handleBehaviourEvent
+);
+
+async function handleBehaviourEvent(e) {
+	const detail = e.detail;
+	if (!detail) return;
+
+	if (detail.type === "cart") {
+		processCartPayload(detail);
+	} else if (detail.type === "purchase") {
+		//SPRINT 10
+		processOrderPayload(detail);
+	} else if (detail.type === "visitedPage") {
+		processVisitedPagePayload(detail); //BUG FIX - removed return statement from here
+		checkCrossPageProactiveState();
+		checkTimeOnPageOnLoad();
+	}
+
+	//Get all cached data, sorted and mapped
+	const sortedEngagements = getAllCachedEngagementData() || [];
+	if (sortedEngagements.length === 0) {
+		Logger.log("No engagements found in cache.");
+		return;
+	}
+
+	if (!sessionStorage.getItem("proactiveChatAlreadyInvokedOrDismissed")) {
+		//Loop through engagements IN RANK ORDER to find the first match
+		let matchedEngagement = null;
+
+		for (const engagement of sortedEngagements) {
+			Logger.log(
+				`Evaluating engagement rank: ${engagement.ranking}, name: ${engagement.name}, type: ${engagement.engagementType}`
+			);
+
+			let isPrimaryRuleMet = false;
+			let otherConditionsMet = false;
+
+			//Switch logic based on Engagement Type
+			if (engagement.engagementType === "Flow") {
+				isPrimaryRuleMet = checkEngagementFlowRules(engagement);
+				if (isPrimaryRuleMet) {
+					// For flows, check other behavior conditions, excluding page-based ones
+					otherConditionsMet = checkBehaviourRules(
+						detail,
+						engagement.behaviorConditions,
+						"Flow"
+					);
+				}
+			} else {
+				// Default to 'Entry Point' logic
+				const pageRules = engagement?.entryPointLibrary?.pages || [];
+				isPrimaryRuleMet = checkEntryPointRules(pageRules);
+				if (isPrimaryRuleMet) {
+					// For entry points, check all behavior conditions
+					otherConditionsMet = checkBehaviourRules(
+						detail,
+						engagement.behaviorConditions,
+						"Entry Point"
+					);
+				}
+			}
+
+			if (isPrimaryRuleMet && otherConditionsMet) {
+				Logger.log(`Match found! Engagement: ${engagement.name}`);
+				matchedEngagement = engagement;
+				if (AppState.FLOWSTATE.timerId) {
+					clearTimeout(AppState.FLOWSTATE.timerId);
+					sessionStorage.removeItem("flowEvaluationState");
+				}
+				break; // Exit loop on first match
+			}
+		}
+
+		//If a match was found, proceed to check availability and trigger
+		if (matchedEngagement) {
+			// for the matched engagement, pass the skill to find an Agent
+			AppState.FINAL_MATCHED_ENGAGEMENT = matchedEngagement;
+
+			if (AppState.ORG_BIZ_UNIT === "DLR" || (await checkAgentAvailability())) {
+				triggerProactiveFlow();
+			}
+			//SIT BugFix Start
+			if (detail.type === "cart") {
+				updateCartState(detail);
+			}
+			//SIT BugFix End
+		} else {
+			Logger.log("No matching engagement found for the event.", detail);
+		}
+	}
+}
+
+/**
+ * Main router to check different types of engagement flows.
+ */
+function checkEngagementFlowRules(engagement) {
+	if (
+		!engagement ||
+		!Array.isArray(engagement.engagementFlows) ||
+		engagement.engagementFlows.length === 0
+	) {
+		return false;
+	}
+
+	switch (engagement.engagementFlowType) {
+		case "Normal":
+			return evaluateNormalFlow(engagement);
+		case "Backflow":
+			return evaluateBackflow(engagement);
+		case "Abandonment":
+			return evaluateAbandonmentFlow(engagement);
+		default:
+			return false;
+	}
+}
+
+/**
+ * Starts or checks the master timer for a flow evaluation.
+ */
+function manageFlowTimer(engagement) {
+	const flowTimeoutMs = (engagement.engFlowEvalInMins || 15) * 60 * 1000;
+	const storedStateStr = sessionStorage.getItem("flowEvaluationState");
+	let state = storedStateStr ? JSON.parse(storedStateStr) : {};
+
+	const now = Date.now();
+
+	// If a different flow is being evaluated, or timer expired, reset.
+	if (
+		state.engagementId !== engagement.id ||
+		(state.startTime && now - state.startTime > flowTimeoutMs)
+	) {
+		state = {}; // Reset
+	}
+
+	// Start the timer if it's not already running for this flow
+	if (!state.startTime) {
+		state.startTime = now;
+		state.engagementId = engagement.id;
+		sessionStorage.setItem("flowEvaluationState", JSON.stringify(state));
+		AppState.FLOWSTATE = state; //SIT Bug Fix
+		Logger.log(
+			`Starting flow evaluation timer for "${engagement.name}" (${engagement.engFlowEvalInMins} mins).`
+		);
+	}
+
+	// Return true if we are within the time limit, false if expired
+	return now - state.startTime <= flowTimeoutMs;
+}
+
+/**
+ * Evaluates if the user has followed all URLs in sequence.
+ */
+function evaluateNormalFlow(engagement) {
+	const isWithinTime = manageFlowTimer(engagement);
+	if (!isWithinTime) {
+		sessionStorage.removeItem("flowEvaluationState");
+		return false;
+	}
+
+	const visitedPages =
+		JSON.parse(localStorage.getItem("VisitedPageInfo"))?.visitedPages || [];
+	const flowSteps = engagement.engagementFlows; // Already sorted by sequence
+
+	if (visitedPages.length < flowSteps.length) return false;
+
+	// Check if the most recent visited pages match the flow sequence in order
+	for (let i = 0; i < flowSteps.length; i++) {
+		const flowStep = flowSteps[i];
+		// visitedPages is newest first, so we check from the start of that array
+		const visitedPageUrl = visitedPages[flowSteps.length - 1 - i][1]; // URL is the 2nd element
+
+		// Use the compareValues logic to respect 'Contains' vs 'Equals'
+		if (!compareValues(visitedPageUrl, flowStep.url, flowStep.operator)) {
+			return false; // Sequence is broken
+		}
+	}
+
+	Logger.log(`Normal Flow matched for engagement: "${engagement.name}"`);
+	return true;
+}
+
+/**
+ * Evaluates if the user has navigated from a later step to an earlier one.
+ */
+function evaluateBackflow(engagement) {
+	const isWithinTime = manageFlowTimer(engagement);
+	if (!isWithinTime) {
+		sessionStorage.removeItem("flowEvaluationState");
+		return false;
+	}
+
+	const visitedPages =
+		JSON.parse(localStorage.getItem("VisitedPageInfo"))?.visitedPages || [];
+	if (visitedPages.length < 2) return false; // Need at least two pages to detect backflow
+
+	const flowSteps = engagement.engagementFlows;
+	const firstStepUrl = flowSteps[0].url;
+
+	// Prerequisite: The user must have visited the first step at some point
+	const hasVisitedFirstStep = visitedPages.some((page) =>
+		compareValues(page[1], firstStepUrl, "Contains")
+	);
+	if (!hasVisitedFirstStep) return false;
+
+	// Get the two most recent pages
+	const currentPageUrl = visitedPages[0][1];
+	const previousPageUrl = visitedPages[1][1];
+
+	// Find the sequence index of the current and previous pages
+	const findIndex = (url) =>
+		flowSteps.findIndex((step) => compareValues(url, step.url, step.operator));
+
+	const currentIndex = findIndex(currentPageUrl);
+	const previousIndex = findIndex(previousPageUrl);
+
+	// Backflow is when the current index is lower than the previous one
+	if (
+		currentIndex !== -1 &&
+		previousIndex !== -1 &&
+		currentIndex < previousIndex
+	) {
+		Logger.log(`Backflow detected for engagement: "${engagement.name}"`);
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * Evaluates if the user has skipped a step in the flow.
+ */
+function evaluateAbandonmentFlow(engagement) {
+	const isWithinTime = manageFlowTimer(engagement);
+	if (!isWithinTime) {
+		sessionStorage.removeItem("flowEvaluationState");
+		return false;
+	}
+
+	const visitedPages =
+		JSON.parse(localStorage.getItem("VisitedPageInfo"))?.visitedPages || [];
+	if (visitedPages.length < 2) return false;
+
+	const flowSteps = engagement.engagementFlows;
+
+	// Get the two most recent pages
+	const currentPageUrl = visitedPages[0][1];
+	const previousPageUrl = visitedPages[1][1];
+
+	// Find their sequence indices
+	const findIndex = (url) =>
+		flowSteps.findIndex((step) => compareValues(url, step.url, step.operator));
+
+	const currentIndex = findIndex(currentPageUrl);
+	const previousIndex = findIndex(previousPageUrl);
+
+	// This is an abandonment if the previous page was in the flow, but the current one isn't.
+	if (previousIndex !== -1 && currentIndex === -1) {
+		Logger.log(
+			`Abandonment Flow detected for engagement: "${engagement.name}" (User navigated out of the flow from step index ${previousIndex})`
+		);
+		return false;
+	}
+
+	// If the user was never in the flow to begin with, or we can't find both pages,
+	// then we cannot evaluate a skip.
+	if (currentIndex === -1 || previousIndex === -1) {
+		return false;
+	}
+
+	// An abandonment is a forward skip OR a large backward jump (more than 1 step).
+	const isForwardSkip = currentIndex > previousIndex + 1;
+	const isBackwardSkip = previousIndex > currentIndex + 1; // This logic for backward skips is correct.
+
+	if (isForwardSkip || isBackwardSkip) {
+		Logger.log(
+			`Abandonment Flow detected for engagement: "${engagement.name}" (Skipped from index ${previousIndex} to ${currentIndex})`
+		);
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * This function checks for an active proactive session when a new page loads.
+ */
+async function checkCrossPageProactiveState() {
+	const expirationTimestamp = localStorage.getItem(
+		"proactiveFollowTimerExpiresAt"
+	);
+	const storedEngagementStr = localStorage.getItem("activeProactiveEngagement");
+
+	// If there's no active follow-up session, do nothing.
+	if (!expirationTimestamp || !storedEngagementStr) {
+		return;
+	}
+
+	// If the master follow-up timer has expired, clean up and stop.
+	if (Date.now() > parseInt(expirationTimestamp, 10)) {
+		Logger.log(
+			"Follow Consumer timer has expired. Cleaning up localStorage state."
+		);
+		localStorage.removeItem("proactiveFollowTimerExpiresAt");
+		localStorage.removeItem("activeProactiveEngagement");
+		return;
+	}
+
+	// Restore engagement for follow-up use
+	try {
+		AppState.FINAL_MATCHED_ENGAGEMENT = JSON.parse(storedEngagementStr);
+	} catch (e) {
+		Logger.warn("Invalid stored engagement JSON; clearing follow state.");
+		localStorage.removeItem("proactiveFollowTimerExpiresAt");
+		localStorage.removeItem("activeProactiveEngagement");
+		return;
+	}
+
+	Logger.log(
+		"Follow Consumer(seconds) timer is active, opening proactive chat in new page"
+	);
+	triggerProactiveFlow(true); // Pass true to indicate this is a follow-up trigger
+}
+
+window.addEventListener("storage", (event) => {
+	if (
+		event.key === "proactiveChatAlreadyInvokedOrDismissed" &&
+		event.newValue === "true"
+	) {
+		Logger.log(
+			"Detected user action from another tab. Terminating proactive session in this tab."
+		);
+		window.dispatchEvent(
+			new CustomEvent("onEmbeddedMessagingProactiveHideDialog")
+		);
+		if (AppState.PROACTIVE_TIMER_ID) clearTimeout(AppState.PROACTIVE_TIMER_ID);
+		if (AppState.TIME_ON_PAGE_TIMER) clearTimeout(AppState.TIME_ON_PAGE_TIMER);
+	}
+});
+
+/**
+ * This function runs once on page load to check for time-based rules
+ */
+async function checkTimeOnPageOnLoad() {
+	//BUGFIX SPRINT 9: Cancel the page-load timer if any other user behavior occurs ---
+	if (AppState.TIME_ON_PAGE_TIMER) {
+		clearTimeout(AppState.TIME_ON_PAGE_TIMER);
+		AppState.TIME_ON_PAGE_TIMER = null;
+		Logger.log("Page load timer canceled due to new user activity.");
+	}
+
+	if (sessionStorage.getItem("proactiveChatAlreadyInvokedOrDismissed")) {
+		Logger.log(
+			"Proactive chat already shown this session, skipping Time on Page check."
+		);
+		return;
+	}
+
+	const sortedEngagements = getAllCachedEngagementData() || [];
+	if (sortedEngagements.length === 0) {
+		return; // No engagements to check
+	}
+
+	// Find the first (highest-ranking) engagement that matches the page and has a time condition
+	for (const engagement of sortedEngagements) {
+		const pageRules = engagement?.entryPointLibrary?.pages || [];
+		const timeCondition = engagement.behaviorConditions?.find(
+			(c) => c.conditionType === "Time on Page"
+		);
+
+		if (timeCondition && checkEntryPointRules(pageRules)) {
+			const delayInSeconds = parseInt(timeCondition.targetValue, 10);
+
+			// Check if all other behavior rules for this engagement are met (if any)
+			// For a simple time-on-page rule, this will just be the time condition itself.
+			// This logic assumes other conditions aren't dependent on a dynamic event (like cart value).
+			//const otherConditionsMet = checkBehaviourRules({}, engagement.behaviorConditions.filter(c => c.conditionType !== 'Time on Page'));
+
+			if (!isNaN(delayInSeconds) && delayInSeconds > 0) {
+				Logger.log(
+					`Setting Time on Page timer for ${delayInSeconds}s based on engagement: ${engagement.name}`
+				);
+
+				// Set the timer
+				AppState.TIME_ON_PAGE_TIMER = setTimeout(async () => {
+					Logger.log(
+						`Time on Page timer fired for engagement: ${engagement.name}`
+					);
+					AppState.FINAL_MATCHED_ENGAGEMENT = engagement;
+
+					if (
+						AppState.ORG_BIZ_UNIT === "DLR" ||
+						(await checkAgentAvailability())
+					) {
+						triggerProactiveFlow();
+					} else {
+						Logger.log("Agent not available after Time on Page timer.");
+					}
+				}, delayInSeconds * 1000);
+
+				// We've found and set the timer for the highest-ranking engagement, so we stop.
+				break;
+			}
+		}
+	}
+}
+
+/**
+ * Checks if the current page URL matches the given entry point rules.
+ * This is now a synchronous utility function.
+ */
+function checkEntryPointRules(pageRules) {
+	if (!Array.isArray(pageRules) || pageRules.length === 0) return false; // No rules means it's valid everywhere
+
+	const currentUrl = window.location.href.toLowerCase();
+
+	// Check for an explicit exclusion first
+	const isExcluded = pageRules.some(
+		(rule) =>
+			(rule.matchingCriteria || "").toLowerCase() === "exclude" &&
+			rule.name &&
+			currentUrl.includes(rule.name.toLowerCase())
+	);
+	if (isExcluded) return false;
+
+	// Check for an inclusion match
+	return pageRules.some((rule) => {
+		const criteria = (rule.matchingCriteria || "Equals").toLowerCase();
+		const ruleUrl = (rule.name || "").toLowerCase();
+		if (!ruleUrl || criteria === "exclude") return false; // Ignore empty or exclude rules here
+		if (criteria === "equals") return currentUrl === ruleUrl;
+		if (criteria === "contains") return currentUrl.includes(ruleUrl);
+		return false;
+	});
+}
+
+/**
+ * Checks if an event detail matches ALL behavioural rules for a specific engagement.
+ * This is now a synchronous utility function with AND logic.
+ */
+function checkBehaviourRules(detail, conditions, engagementType) {
+	if (!Array.isArray(conditions) || conditions.length === 0) {
+		if (engagementType == "Entry Point") return false;
+		else if (engagementType == "Flow") return true;
+	}
+
+	let applicableConditions = conditions;
+
+	// Filter out Visited Page & Time on Page for 'Flow' types
+	if (engagementType === "Flow") {
+		applicableConditions = conditions.filter(
+			(rule) =>
+				rule.conditionType !== "Visited Pages" &&
+				rule.conditionType !== "Time on Page"
+		);
+		// If filtering leaves no conditions for a Flow type, it's a match
+		if (applicableConditions.length === 0) return true;
+	}
+
+	// Use .every() to enforce that ALL conditions must be true (AND operation)
+	return applicableConditions.every((rule) => {
+		const {
+			conditionType: type,
+			operator = "Equals",
+			targetValue: target,
+		} = rule;
+
+		switch (type) {
+			//BUGFIX START
+			case "Cart Abandonment":
+				// This condition doesn't use operator or target value.
+				// It checks if the number of items in the cart went from > 0 to 0.
+				if (detail.type == "cart") {
+					const previousNumItemsStr = localStorage.getItem(
+						"PreviousCartNumItems"
+					);
+					if (previousNumItemsStr === null) {
+						return false; // Can't abandon a cart that we haven't seen before.
+					}
+					const previousNumItems = parseInt(previousNumItemsStr, 10);
+					const currentNumItems =
+						detail.numItems !== undefined ? detail.numItems : 0;
+
+					return (
+						!isNaN(previousNumItems) &&
+						previousNumItems > 0 &&
+						currentNumItems === 0
+					);
+				} else {
+					return false;
+				}
+			//BUGFIX END
+
+			case "Cart Value":
+				//BUGFIX START
+				if (detail.type == "cart") {
+					if (operator === "Decrease by") {
+						const previousTotalStr = localStorage.getItem("PreviousCartTotal");
+						// This rule can only be met if there was a previous total to compare against.
+						if (previousTotalStr === null) {
+							return false;
+						}
+
+						const previousTotal = parseFloat(previousTotalStr);
+						const currentTotal = detail.total || 0;
+						const targetDecrease = parseFloat(target);
+
+						if (
+							isNaN(previousTotal) ||
+							isNaN(currentTotal) ||
+							isNaN(targetDecrease)
+						) {
+							return false; // Invalid numbers
+						}
+
+						const actualDecrease = previousTotal - currentTotal;
+
+						// Check if the cart value actually decreased and if the decrease meets the target.
+						return actualDecrease > 0 && actualDecrease >= targetDecrease;
+					} else {
+						// For all other operators, use the existing logic.
+						return compareValues(detail.total || 0, target, operator);
+					}
+				} else {
+					return false;
+				}
+			//BUGFIX END
+
+			case "Product Category":
+				// For cart items, at least ONE item must match the condition.
+				return (
+					Array.isArray(detail.products) &&
+					detail.products.some((item) =>
+						compareValues(item.product.category || "", target, operator)
+					)
+				);
+
+			case "Product Name":
+				return (
+					Array.isArray(detail.products) &&
+					detail.products.some((item) =>
+						compareValues(item.product.name || "", target, operator)
+					)
+				);
+
+			case "Error Code":
+				return compareValues(detail.value || "", target, operator);
+
+			case "Error Message":
+				return compareValues(detail.value || "", target, operator);
+
+			//BUFIX START
+			case "Visited Pages":
+				return compareValues(
+					localStorage.getItem("currentVisitedPageUrl") || detail.value || "",
+					target,
+					operator
+				);
+			//BUFIX END
+
+			//BUFIX SPRINT 9 START
+			case "Time on Page":
+				if (detail.type === "timeOnPage")
+					return compareValues(detail.value, target, operator);
+				else return false;
+			//BUFIX SPRINT 9 END
+
+			default:
+				// If the conditionType from the rule doesn't match any known case, this condition fails.
+				return false;
+		}
+	});
+}
+
+function compareValues(actual, target, operator = "Equals") {
+	if (actual == null || target == null) return false;
+
+	const nActual = Number(actual);
+	const nTarget = Number(target);
+	const bothNumbers = !Number.isNaN(nActual) && !Number.isNaN(nTarget);
+
+	const sActual = String(actual).toLowerCase();
+	const sTarget = String(target).toLowerCase();
+
+	/* ---------- Operator logic ---------- */
+	switch (operator) {
+		/* Equality works for both numbers and strings */
+		case "Equals":
+			return bothNumbers ? nActual === nTarget : sActual === sTarget;
+
+		case "Not equal to":
+			return bothNumbers ? nActual !== nTarget : sActual !== sTarget;
+
+		/* String-only */
+		case "Contains":
+			return sActual.includes(sTarget);
+
+		//BUGFIX START
+		case "Exclude":
+			return !sActual.includes(sTarget);
+		//BUGFIX END
+
+		/* Numeric-only (guard with bothNumbers) */
+		case "Greater than":
+			return bothNumbers && nActual > nTarget;
+		case "Greater or equal":
+			return bothNumbers && nActual >= nTarget;
+		case "Less than":
+			return bothNumbers && nActual < nTarget;
+		case "Less or equal":
+			return bothNumbers && nActual <= nTarget;
+
+		/* Unknown operator â†’ always false */
+		default:
+			Logger.warn(`compareValues: unknown operator “${operator}”`);
+			return false;
+	}
+}
+
+//================================================================================
+// REAL TIME MESSAGING INFO PASSING
+//================================================================================
+
+/**
+ * Processes the cart payload and stores it in localStorage.
+ */
+function processCartPayload(payload) {
+	if (!payload || !payload.products) {
+		Logger.error("Invalid cart payload provided.");
+		return;
+	}
+
+	if (payload.isOnlyForProactive) {
+		Logger.log(
+			"Cart payload is for proactive evaluation only, skipping storage and API updates."
+		);
+		return;
+	}
+
+	// This part remains the same
+	const cartContent = payload.products.map((item) => {
+		const p = item.product;
+		return `${p.name}; ${p.category}; ${p.price}; ${item.quantity}`;
+	});
+
+	// --- CHANGE IS HERE: Assemble a final OBJECT instead of an array ---
+	const cartInfoObject = {
+		cartItems: cartContent,
+		totalPrice: payload.total,
+		totalQuantity: payload.numItems,
+		conversationId: payload.conversationId || AppState.CONVERSATION_ID,
+		// timestamp: convertTimestampToISOString(payload.dateTime) // You can uncomment this if needed
+	};
+
+	// SPRINT 12 START
+	// A chat is considered active only if we have a conversation ID AND it hasn't ended.
+	const isChatValidForCart = payload.conversationId && !AppState.CHAT_HAS_ENDED;
+
+	if (
+		isChatValidForCart &&
+		window.embeddedservice_bootstrap?.utilAPI?.launchChat
+	) {
+		// If the chat is live, push the data in real-time.
+		Logger.log("Pushing cart data in real-time.");
+		pushMessagingData("Cart Detail", JSON.stringify(cartInfoObject));
+	} else {
+		//store in cache
+		// Store the new OBJECT in localStorage
+		Logger.log("Storing cart data before chat in localStorage.");
+		localStorage.setItem("CartInfo", JSON.stringify(cartInfoObject));
+	}
+	// SPRINT 12 END
+
+	// BUGFIX START CHANGE
+	// Storing this info for the cart decrease by comparison agaisnt the previous value
+	if (
+		typeof payload.total === "number" &&
+		!localStorage.getItem("PreviousCartTotal")
+	) {
+		Logger.log(`Setting PreviousCartTotal to: ${payload.total}`);
+		localStorage.setItem("PreviousCartTotal", payload.total);
+	}
+	if (
+		typeof payload.numItems === "number" &&
+		!localStorage.getItem("PreviousCartNumItems")
+	) {
+		Logger.log(`Setting PreviousCartNumItems to: ${payload.numItems}`);
+		localStorage.setItem("PreviousCartNumItems", payload.numItems);
+	}
+	// BUGFIX START END
+}
+
+/** SIT BugFix
+ * Updates the 'Previous' state in localStorage after rule evaluation is complete.
+ */
+function updateCartState(detail) {
+	// Update Total
+	if (typeof detail.total === "number") {
+		// We set the current total as the "Previous" for the NEXT event
+		localStorage.setItem("PreviousCartTotal", detail.total);
+	}
+
+	// Update Quantity
+	if (typeof detail.numItems === "number") {
+		localStorage.setItem("PreviousCartNumItems", detail.numItems);
+	}
+}
+
+/**
+ * Processes the order payload.
+ */
+function processOrderPayload(payload) {
+	//SPRINT 12 START - If there is no conversation ID, do not proceed.
+	const isChatValidForOrder = payload.conversationId;
+	if (!isChatValidForOrder) {
+		Logger.log(
+			"Order event received, but no active or previous conversation session found. The event will not be sent."
+		);
+		return; // Stop processing if there's no conversation context.
+	}
+	//SPRINT 12 END
+
+	//Check for the nested cart and products array in the purchase payload
+	if (!payload || !payload.cart || !Array.isArray(payload.cart.products)) {
+		Logger.error("Invalid Order payload provided.", payload);
+		return;
+	}
+
+	//Map the products from payload.cart.products
+	const orderContent = payload.cart.products.map((item) => {
+		const p = item.product;
+		return `${p.name}; ${p.category}; ${p.price}; ${item.quantity}`;
+	});
+
+	//Calculate total quantity from the products array
+	const totalQuantity = payload.cart.products.reduce(
+		(sum, item) => {
+			const qty = parseInt(item.quantity, 10);
+			return sum + (isNaN(qty) ? 0 : qty);
+		},
+		0
+	);
+
+	const orderInfoObject = {
+		cartItems: orderContent,
+		totalPrice: payload.total,
+		totalQuantity: totalQuantity,
+		orderId: payload.orderId, // Add the orderId
+		conversationId: payload.conversationId || AppState.CONVERSATION_ID,
+		swid: payload.swid || null, // Include SWID if available
+	};
+	//SPRINT 12 START
+	//For a purchase event, always push the data in real-time.
+	setTimeout(async () => {
+		const success = await pushMessagingData(
+			"Order Detail",
+			JSON.stringify(orderInfoObject)
+		);
+		if (success) {
+			//BUGFIX
+			Logger.log("Successfully pushed Order Details to Server.");
+		}
+	}, 5000); // 5-second delay
+	//SPRINT 12 END
+}
+
+/**
+ * Processes the visited page payload and updates the list in localStorage.
+ */
+function processVisitedPagePayload(payload) {
+	if (!payload || !payload.value) {
+		Logger.error("Invalid visited page payload provided.");
+		return;
+	}
+
+	const maxArrayLength = 1000; //SPRINT 11
+
+	// Get the existing array from localStorage or create a new one. This part is fine.
+	let visitedPages =
+		JSON.parse(localStorage.getItem("VisitedPageInfo"))?.visitedPages || [];
+
+	const newPageEntry = [
+		payload.pageTitle,
+		payload.value, // This is the pageurl
+		convertTimestampToISOString(payload.dateTime),
+	];
+
+	// Add the new entry only if it's not the same URL as the most recent one
+	const isNewPage =
+		visitedPages.length === 0 || visitedPages[0][1] !== payload.value;
+	if (isNewPage) {
+		visitedPages.unshift(newPageEntry);
+	}
+
+	// If the array is too long, remove the oldest item from the end
+	if (visitedPages.length > maxArrayLength) {
+		visitedPages.pop();
+	}
+
+	const visitedPagesObject = {
+		visitedPages: visitedPages,
+		conversationId: payload.conversationId || AppState.CONVERSATION_ID,
+	};
+
+	let visitedPagesObjectStr = JSON.stringify(visitedPagesObject);
+
+	//SPRINT 12 START
+	const isChatValidForVisitedPage =
+		payload.conversationId && !AppState.CHAT_HAS_ENDED;
+
+	if (
+		isChatValidForVisitedPage &&
+		window.embeddedservice_bootstrap?.utilAPI?.launchChat
+	) {
+		Logger.log(
+			"conversationId fore real time page visits==> ",
+			visitedPagesObject.conversationId
+		);
+		if (isNewPage) {
+			const singlePagePayload = JSON.stringify({
+				visitedPages: [newPageEntry],
+				conversationId: visitedPagesObject.conversationId,
+			});
+			pushMessagingData("Visited Page", singlePagePayload);
+		}
+		localStorage.setItem("VisitedPageInfo", visitedPagesObjectStr);
+	} else {
+		Logger.log("VisitedPageInfo before chat update local storage");
+		localStorage.setItem("VisitedPageInfo", visitedPagesObjectStr);
+	}
+	//SPRINT 12 END
+
+	// Track the most recent visited page URL for proactive follow-up logic
+	try {
+		if (payload.value) {
+			localStorage.setItem("currentVisitedPageUrl", String(payload.value));
+		}
+	} catch (e) {
+		Logger.warn(
+			"Failed to set currentVisitedPageUrl from visitedPage payload.",
+			e
+		);
+	}
+}
+
+/**
+ * Converts a Unix timestamp (in milliseconds) to a 'mm/dd/yyyy hh:mm:ss AM/PM' string.
+ */
+function convertTimestampToISOString(timestampString) {
+	const timestampNumber = parseInt(timestampString, 10);
+
+	if (isNaN(timestampNumber)) {
+		Logger.error(
+			"Invalid input: The provided string is not a valid timestamp.",
+			timestampString
+		);
+		return null; // Return null to indicate failure.
+	}
+
+	const dateObject = new Date(timestampNumber);
+	return JSON.stringify(dateObject.toISOString());
+}
+
+// This handles the auth user scenario where chat "never ends"
+window.addEventListener(
+	"onEmbeddedMessagingSessionStatusUpdate",
+	handleSessionStatusUpdate
+);
+
+// Sends all the cached information on conversation start
+window.addEventListener("onEmbeddedMessagingConversationStarted", (event) => {
+	//Once chat starts send everything in the local storage
+	AppState.CHAT_HAS_ENDED = false; //SPRINT 12
+	AppState.CONVERSATION_ID = event?.detail.conversationId;
+	Logger.log(
+		"onEmbeddedMessagingConversationStarted: CONVERSATION_ID==> " +
+		AppState.CONVERSATION_ID
+	);
+
+	// Call the shared function to send cached data
+	handleNewConversationStart();
+	AppState.IS_COVERSATION_STARTED = true;
+});
+
+/*
+ * Handles the onEmbeddedMessagingSessionStatusUpdate event based on the
+ * This is the primary way to detect "start" and "end" for authenticated users
+ * who have persistent chat sessions. Also, works for guest users.
+ */
+function handleSessionStatusUpdate(event) {
+	Logger.log(
+		"onEmbeddedMessagingSessionStatusUpdate event received:",
+		event.detail
+	);
+	const conversationEntry = event?.detail?.conversationEntry;
+	const payloadString = conversationEntry?.entryPayload;
+	const parsedPayload = JSON.parse(payloadString);
+	// Get the status from the event detail payload
+	const status = parsedPayload.sessionStatus;
+	const conversationId = event.detail.conversationId;
+
+	switch (status) {
+		case "Active":
+			//'New session'
+			Logger.log(
+				'SessionStatusUpdate: New conversation detected (status: "New").'
+			);
+			AppState.CHAT_HAS_ENDED = false;
+
+			if (
+				!AppState.IS_COVERSATION_STARTED &&
+				conversationId &&
+				AppState.CONVERSATION_ID !== conversationId
+			) {
+				AppState.CONVERSATION_ID = conversationId;
+				Logger.log(
+					'SessionStatusUpdate: CONVERSATION_ID set on "Active":',
+					AppState.CONVERSATION_ID
+				);
+
+				// Call the shared function to send any cached data
+				handleNewConversationStart();
+			} else {
+				Logger.warn(
+					'SessionStatusUpdate: status="New" but no conversationId found in event.'
+				);
+			}
+			break;
+
+		case "Ended":
+			//'Session ended'
+			Logger.log(`SessionStatusUpdate: Conversation ended (status: "Ended").`);
+			AppState.CHAT_HAS_ENDED = true;
+			break;
+
+		case "Waiting":
+			//'Waiting Session'
+			Logger.log("SessionStatusUpdate: Session is waiting.");
+			AppState.CHAT_HAS_ENDED = false; // A waiting chat is not an ended chat
+			break;
+
+		default:
+			Logger.log(`SessionStatusUpdate: Unknown status received: "${status}"`);
+	}
+}
+
+/**
+ * Secure Form scenario, when the user fill & submits the secure form
+ */
+window.addEventListener("onEmbeddedMessageSent", handleMessageSent);
+
+function handleMessageSent(event) {
+	try {
+		const detail = event.detail;
+		const messageEntry = detail.conversationEntry || detail;
+
+		// 1. Check if we have a string payload to parse
+		if (
+			messageEntry.entryPayload &&
+			typeof messageEntry.entryPayload === "string"
+		) {
+			const payload = JSON.parse(messageEntry.entryPayload);
+			const abstractMsg = payload.abstractMessage;
+
+			if (abstractMsg && abstractMsg.formResponse && abstractMsg.references) {
+				// 2. Check logic: Look for "Secure Form created." in the records
+				const records = abstractMsg.formResponse.result?.records;
+				const isFormCreated =
+					Array.isArray(records) &&
+					records.some((r) => r.resultMessage === "Secure Form created.");
+
+				if (isFormCreated) {
+					// 3. Extract the Record ID from the references array
+					const targetId = abstractMsg.references[0]?.recordId;
+
+					if (targetId) {
+						Logger.log("Secure Form ID Found:", targetId);
+
+						// 4. Call Server-Side API to link Secure Form
+						// We prioritize the conversationId from the event detail, fallback to AppState
+						const currentConversationId =
+							detail.conversationId || AppState.CONVERSATION_ID;
+
+						if (currentConversationId) {
+							linkSecureFormToSession(targetId, currentConversationId);
+						} else {
+							Logger.warn(
+								"Secure Form ID found, but no active Conversation ID available to link."
+							);
+						}
+					}
+				}
+			}
+		}
+	} catch (error) {
+		Logger.error("Error handling message sent:", error);
+	}
+}
+
+/**
+ * Call the Salesforce Apex REST API to link the Secure Form to the Messaging Session.
+ */
+async function linkSecureFormToSession(secureFormId, conversationId) {
+	if (
+		!AppState.BASE_API_URL ||
+		!AppState.ORG_BIZ_UNIT ||
+		!AppState.CHAT_ENV ||
+		!secureFormId ||
+		!conversationId
+	) {
+		Logger.error("Cannot link Secure Form, missing required parameters.");
+		return;
+	}
+
+	const endpoint = `${AppState.BASE_API_URL
+		}form/?brand=${AppState.ORG_BIZ_UNIT.toLowerCase()}&env=${AppState.CHAT_ENV}`;
+
+	// Construct payload matching the Apex Class wrapper: secureFormLinkagePayload
+	const body = JSON.stringify({
+		secureFormRecordId: secureFormId,
+		conversationId: conversationId,
+	});
+
+	try {
+		const resp = await fetch(endpoint, {
+			method: "PUT",
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body: body,
+		});
+
+		if (!resp.ok) {
+			throw new Error(`API Error: Status ${resp.status} ${resp.statusText}`);
+		}
+
+		const data = await resp.json();
+
+		if (data.status === "Success") {
+			Logger.log("Secure Form linked successfully on server:", data);
+		} else {
+			Logger.error(
+				"Server returned error during Secure Form linkage:",
+				data.message
+			);
+		}
+	} catch (err) {
+		Logger.error("Failed to link Secure Form:", err);
+	}
+}
+
+/**
+ * Handles the logic for sending cached data at the start of any new conversation.
+ * This is called by "onEmbeddedMessagingSessionStatusUpdate"
+ */
+function handleNewConversationStart() {
+	Logger.log("handleNewConversationStart: Checking for cached data...");
+	Logger.log("cart local storage==> " + localStorage.getItem("CartInfo"));
+	Logger.log(
+		"visited pages local storage==> " + localStorage.getItem("VisitedPageInfo")
+	);
+
+	// Check for cached CartInfo and send it
+	if (localStorage.getItem("CartInfo") && AppState.CONVERSATION_ID) {
+		let cartInfoObject = JSON.parse(localStorage.getItem("CartInfo"));
+		cartInfoObject.conversationId = AppState.CONVERSATION_ID; // Add the new conversation ID
+		let updatedCartInfoString = JSON.stringify(cartInfoObject);
+		Logger.log("sending cart message payload at start of chat");
+		setTimeout(async () => {
+			if (isChatEnded()) return;
+			const success = await pushMessagingData(
+				"Cart Detail",
+				updatedCartInfoString
+			);
+			if (success) {
+				Logger.log("Successfully pushed CartInfo, removing from localStorage.");
+				localStorage.removeItem("CartInfo");
+			}
+		}, 5000);
+	}
+
+	// Check for cached VisitedPageInfo and send it
+	if (localStorage.getItem("VisitedPageInfo")) {
+		let visitedInfoObject = JSON.parse(localStorage.getItem("VisitedPageInfo"));
+		const seen = new Set();
+		visitedInfoObject.visitedPages = visitedInfoObject.visitedPages.filter(
+			(page) => {
+				if (seen.has(page[1])) return false;
+				seen.add(page[1]);
+				return true;
+			}
+		);
+		visitedInfoObject.conversationId = AppState.CONVERSATION_ID;
+		let updatedVisitedInfoString = JSON.stringify(visitedInfoObject);
+		Logger.log("sending visited page message payload at start of chat");
+		setTimeout(async () => {
+			if (isChatEnded()) return;
+			const success = await pushMessagingData(
+				"Visited Page",
+				updatedVisitedInfoString
+			);
+			if (success) {
+				Logger.log(
+					"Successfully pushed VisitedPageInfo, removing from localStorage."
+				);
+				localStorage.removeItem("VisitedPageInfo");
+			}
+		}, 5000); // 5-second delay
+	}
+}
+
+/**
+ * Validates if the conversation has ended and logs an error if it has.
+ */
+function isChatEnded() {
+	if (AppState.CHAT_HAS_ENDED) {
+		Logger.error("Cannot push messaging data, chat has ended.");
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Pushes cart and Visited pages to Salesforce server
+ */
+async function pushMessagingData(messagingType, payload) {
+	if (
+		!AppState.CHAT_ENV ||
+		!AppState.ORG_BIZ_UNIT ||
+		!messagingType ||
+		!payload
+	) {
+		Logger.error("Cannot push messaging data due to missing data.");
+		return false;
+	}
+
+	const dataMapping = {
+		"Cart Detail": "cart",
+		"Order Detail": "purchase",
+		"Visited Page": "visitedPage",
+	};
+	try {
+		const endpoint = `${AppState.BASE_API_URL}details/${dataMapping[messagingType]
+			}/?brand=${AppState.ORG_BIZ_UNIT.toLowerCase()}&env=${AppState.CHAT_ENV}`;
+		const body = JSON.stringify({
+			type: messagingType,
+			value: payload,
+		});
+
+		const resp = await fetch(endpoint, {
+			method: "PUT",
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body,
+		});
+
+		if (!resp.ok) {
+			throw new Error(`API Error: Status ${resp.status} ${resp.statusText}`);
+		}
+
+		const data = await resp.json();
+		if (data.status === "Success") {
+			Logger.log("Successfully pushed data to Salesforce.");
+			return true;
+		} else {
+			Logger.error("Salesforce API returned an error:", data.message);
+			const apiError = new Error(data.message); //BUGFIX
+			dispatchFailureEvent(messagingType, payload, apiError); //BUGFIX
+			return false;
+		}
+	} catch (error) {
+		Logger.error("Push Messaging Data failed:", error);
+		dispatchFailureEvent(messagingType, payload, error); //BUGFIX
+		return false;
+	}
+}
+
+//BUGFIX START
+//Dispatches a custom event when the pushMessagingData API fails.
+function dispatchFailureEvent(type, payload, error) {
+	window.dispatchEvent(
+		new CustomEvent("onEmbeddedMessagingProactiveListenerStatus", {
+			detail: {
+				status: "FAILURE",
+				type: type,
+				payload: payload,
+				error: error.message,
+			},
+		})
+	);
+}
+//BUGFIX END
+
+//================================================================================
+// CHAT LIFECYCLE
+//================================================================================
+
+/**
+ * Triggers the proactive chat dialog flow.
+ */
+async function triggerProactiveFlow(isFollowUp = false) {
+	if (!AppState.FINAL_MATCHED_ENGAGEMENT) return;
+
+	try {
+		const engagement = AppState.FINAL_MATCHED_ENGAGEMENT; //SPRINT 10
+		const engCloseSecs = parseInt(engagement.closeAfterSeconds, 10); //SPRINT 10
+		const engFollowSecs = parseInt(engagement.followConsumerSeconds, 10); //SPRINT 10
+		//const engfollowSecs = parseInt(engagement.followConsumerSeconds, 10);//BUGFIX
+		if (!Number.isNaN(engCloseSecs) && engCloseSecs > 0) {
+			Logger.log("EngCloseSecs: ", engCloseSecs);
+			AppState.CLOSE_SECS = engCloseSecs;
+		}
+		// isFollowUp used here bacuse proactiveFollowTimerExpiresAt should be set when BTC is met
+		// and not when follow up across pages for an already triggered proactive chat
+		if (!isFollowUp && !Number.isNaN(engFollowSecs) && engFollowSecs > 0) {
+			AppState.FOLLOW_SECS = engFollowSecs;
+			const expirationTimestamp = Date.now() + AppState.FOLLOW_SECS * 1000;
+			localStorage.setItem(
+				"proactiveFollowTimerExpiresAt",
+				expirationTimestamp
+			);
+			localStorage.setItem(
+				"activeProactiveEngagement",
+				JSON.stringify(engagement)
+			);
+			Logger.log(
+				`Proactive session started. Will follow user for ${AppState.FOLLOW_SECS} seconds.`
+			);
+		}
+	} catch (e) {
+		Logger.warn("Bad engagement JSON in localStorage", e);
+	}
+
+	const currentVisited =
+		localStorage.getItem("currentVisitedPageUrl") || window.location.href;
+
+	if (AppState.PROACTIVE_TIMER_ID) {
+		clearTimeout(AppState.PROACTIVE_TIMER_ID);
+		AppState.PROACTIVE_TIMER_ID = null;
+	}
+
+	// Recreate Close Sec timer fresh for this page
+	AppState.PROACTIVE_TIMER_ID = setTimeout(() => {
+		window.dispatchEvent(
+			new CustomEvent("onEmbeddedMessagingProactiveHideDialog")
+		);
+		// If user did not click Start Chat, clear session flag so it can reappear (for follow-up pages)
+	}, AppState.CLOSE_SECS * 1000);
+
+	// Show proactive dialog. Allow follow-up to show across pages even if previously shown in this session.
+	if (
+		!sessionStorage.getItem("proactiveChatAlreadyInvokedOrDismissed") ||
+		isFollowUp
+	) {
+		window.dispatchEvent(
+			new CustomEvent("onEmbeddedMessagingProactiveShowDialog")
+		);
+		localStorage.setItem("proactiveActivePageUrl", currentVisited);
+	}
+}
+
+/**
+ * Listens for the user to click "Start Chat" from the proactive prompt.
+ */
+window.addEventListener(
+	"onEmbeddedMessagingProactiveStartChat",
+	async (event) => {
+		if (event?.detail) {
+			if (AppState.PROACTIVE_TIMER_ID) {
+				clearTimeout(AppState.PROACTIVE_TIMER_ID);
+				AppState.PROACTIVE_TIMER_ID = null;
+			}
+			Logger.log(
+				"User accepted proactive chat. This session will not be prompted again."
+			);
+			sessionStorage.setItem("proactiveChatAlreadyInvokedOrDismissed", true);
+			localStorage.removeItem("proactiveFollowTimerExpiresAt");
+			localStorage.removeItem("activeProactiveEngagement");
+			await setPreChatParameter(event.detail);
+		}
+	}
+);
+
+/**
+ * Sets pre-chat fields once the messaging component is ready.
+ */
+async function setPreChatParameter(customPrechatFields) {
+	const esb = window.embeddedservice_bootstrap;
+	if (!esb?.prechatAPI) return;
+
+	if (!AppState.FINAL_MATCHED_ENGAGEMENT) return;
+
+	try {
+		const engObj = AppState.FINAL_MATCHED_ENGAGEMENT;
+		const prechatFields = {
+			...(customPrechatFields || {}),
+			Engagement_Group_ID: engObj.engGrpId,
+			Engagement_ID: engObj.id,
+			Skill: engObj.skill,
+		};
+		esb.prechatAPI.setHiddenPrechatFields(prechatFields);
+		window.dispatchEvent(
+			new CustomEvent("onEmbeddedMessagingProactiveHideDialog")
+		);
+		openChat();
+	} catch (e) {
+		Logger.error("Failed to set prechat fields due to bad Engagement JSON", e);
+	}
+}
+/**
+ * Launches the chat window
+ */
+async function openChat() {
+	window.embeddedservice_bootstrap?.utilAPI
+		?.launchChat()
+		.catch((err) => Logger.error("launchChat error:", err));
+	Logger.log("Auto-opened MIAW chat");
+}
+
+/**
+ * Checks if agents for a given skill are available.
+ */
+async function checkAgentAvailability() {
+	if (
+		!AppState.BASE_API_URL ||
+		!AppState.CHAT_ENV ||
+		!AppState.ORG_BIZ_UNIT ||
+		!AppState.FINAL_MATCHED_ENGAGEMENT
+	) {
+		throw new Error(
+			"Cannot check agent availability. Cannot construct API endpoint."
+		);
+	}
+	const endpoint = `${AppState.BASE_API_URL
+		}AgentAvailability/?brand=${AppState.ORG_BIZ_UNIT.toLowerCase()}&env=${AppState.CHAT_ENV
+		}&skillName=${AppState.FINAL_MATCHED_ENGAGEMENT.skill}`;
+
+	try {
+		Logger.log(
+			"Engagement Skill Name==> ",
+			AppState.FINAL_MATCHED_ENGAGEMENT.skill
+		);
+
+		const resp = await fetch(endpoint);
+
+		if (!resp.ok) {
+			throw new Error(`API Error: Status ${resp.status} ${resp.statusText}`);
+		}
+		const data = await resp.json();
+		Logger.log(`Agent Available? ${JSON.parse(data).isAvailable}`);
+		return JSON.parse(data).isAvailable;
+	} catch (err) {
+		Logger.error("Check Agent Availability failed:", err);
+		return false;
+	}
+}
+
+window.addEventListener(
+	"onEmbeddedMessagingProactiveAuthentication",
+	handleProactiveAuth
+);
+
+/**
+ * Handles login, logout events
+ */
+async function handleProactiveAuth(evt) {
+	const swid = evt?.detail?.value;
+	const previousSwid = AppState.SWID;
+	sessionStorage.removeItem("proactiveChatAlreadyInvokedOrDismissed");
+	AppState.SWID = swid;
+	if (swid && previousSwid && swid !== previousSwid) {
+		Logger.log("Different SWID detected. Clearing old auth cache.");
+		clearCachedEngagementData("noSWID", false);
+		localStorage.removeItem("ProactiveContextFingerprint");
+	}
+	await initEngagementData();
+}
+
+//SPRINT 12 START - set the chat end flag once the conversation is closed
+window.addEventListener("onEmbeddedMessagingConversationClosed", (event) => {
+	Logger.log("Conversation has ended");
+	AppState.CHAT_HAS_ENDED = true;
+});
+//SPRINT 12 END
