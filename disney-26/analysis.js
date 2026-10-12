@@ -7,12 +7,12 @@
     for (const sample of sorted) {sum+=sample.minutes;if(sum>=total*q)return sample.wait;}
     return null;
   }
-  function analyze(documents, targetDate, zone='America/New_York') {
+  function analyze(documents, targetDate, zone='America/New_York', matchDayType=true) {
     const buckets = new Map();
     const weekday = date=>new Date(date+'T12:00:00Z').getUTCDay();
     const comparable = date=>[0,6].includes(weekday(date))===[0,6].includes(weekday(targetDate));
     for (const {date,data} of documents) {
-      if (!comparable(date)) continue;
+      if (matchDayType && !comparable(date)) continue;
       for (const entity of data.entities||[]) {
         const opening=entity.opening||{};
         let queueSeen=opening.observedAtByKind?.['queue.STANDBY'];
@@ -48,9 +48,9 @@
     }
     return result;
   }
-  function itinerary(candidates, profiles, {start,end,blocks=[],walk=10,duration=15,height=null}) {
+  function itinerary(candidates, profiles, {start,end,blocks=[],walk=10,duration=15,height=null,categoryLimits={}}) {
     const sortedBlocks=[...blocks].sort((a,b)=>a.start-b.start);
-    const items=[];const remaining=[...candidates];let time=start;
+    const items=[];const remaining=[...candidates];const counts={};let time=start;
     while(time<end&&remaining.length) {
       const active=sortedBlocks.find(b=>time>=b.start&&time<b.end);
       if(active){time=active.end;continue;}
@@ -59,10 +59,11 @@
       const options=remaining.map(r=>{
         const profile=(profiles[r.id]||[]).find(p=>p.hour===Math.floor((time+walk)/60));
         return {r,profile,finish:time+walk+duration+(profile?.median??0)};
-      }).filter(x=>x.profile&&x.finish<=limit&&(height===null||!Number.isFinite(x.r.height)||x.r.height<=height))
+      }).filter(x=>x.profile&&x.finish<=limit&&(height===null||!Number.isFinite(x.r.height)||x.r.height<=height)&&(counts[x.r.category]||0)<(categoryLimits[x.r.category]??Infinity))
         .sort((a,b)=>b.r.votes-a.r.votes||a.profile.median-b.profile.median);
       if(!options.length){time=Math.min(limit, (Math.floor(time/60)+1)*60);continue;}
       const {r,profile,finish}=options[0];items.push({start:time,end:finish,name:r.name,wait:profile.median,range:[profile.p10,profile.p90],days:profile.days});
+      counts[r.category]=(counts[r.category]||0)+1;
       remaining.splice(remaining.indexOf(r),1);time=finish;
     }
     return {items:[...items,...sortedBlocks.map(b=>({...b,fixed:true}))].sort((a,b)=>a.start-b.start),remaining};

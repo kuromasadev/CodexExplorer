@@ -16,3 +16,10 @@ const fit=itinerary([{id:'ride',name:'Ride',votes:3,height:40}],profiles,{start:
 assert.equal(fit.items[0].end,575);
 assert.equal(itinerary([{id:'ride',name:'Ride',votes:3,height:40}],profiles,{start:540,end:660,height:38}).remaining.length,1);
 console.log('History weighting, day types, stale states, reservations, duration and height checks passed.');
+const capped=itinerary([{id:'ride',name:'Ride',votes:3,category:'Ride'}],profiles,{start:540,end:660,categoryLimits:{Ride:0}});
+assert.equal(capped.items.length,0,'Zero category limit excludes all items in the category');
+const twoProfiles={a:profiles.ride,b:profiles.ride};
+const one=itinerary([{id:'a',name:'A',votes:3,category:'Ride'},{id:'b',name:'B',votes:2,category:'Ride'}],twoProfiles,{start:540,end:660,walk:0,duration:1,categoryLimits:{Ride:1}});
+assert.equal(one.items.length,1);
+assert.equal(one.items[0].name,'A','Category caps preserve priority ordering');
+console.log('Category exclusions and maximum counts passed.');

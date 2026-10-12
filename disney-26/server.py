@@ -61,7 +61,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.path.startswith('/api/'):
             return super().do_GET()
         path = self.path[5:]
-        if not re.fullmatch(r'(destinations|entity/[a-zA-Z0-9-]+/(children|live|schedule(?:/\d{4}/\d{2})?|history(?:/coverage)?)(?:\?date=\d{4}-\d{2}-\d{2})?)', path):
+        if not re.fullmatch(r'(destinations|entity/[a-zA-Z0-9-]+/(children|live|schedule(?:/\d{4}/\d{2})?|history(?:/coverage|/daily)?)(?:\?(?:date=\d{4}-\d{2}-\d{2}|from=\d{4}-\d{2}-\d{2}&to=\d{4}-\d{2}-\d{2}))?)', path):
             self.send_error(400)
             return
         try:
