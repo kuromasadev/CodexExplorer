@@ -1,0 +1,16 @@
+const assert=require('node:assert/strict'),R=require('./route-core.js');
+const graph=R.networkGraph({nodes:{a:[28.4,-81.58],b:[28.4001,-81.58],c:[28.4001,-81.5799],d:[28.4002,-81.58]},edges:[['a','b',11],['b','c',10]]});
+assert.equal(R.shortest(graph,'a','c').meters,21);
+assert.equal(R.shortest(graph,'a','d'),null,'Disconnected nodes must not be bridged with a straight line');
+assert(R.route(graph,[28.45,-81.58],[28.4,-81.58]).error,'Remote points must not snap');
+assert.equal(R.summary([{location:[28.4,-81.58]},{location:null}],(a,b)=>R.route(graph,a.location,b.location)).meters,null);
+const directed=R.networkGraph({nodes:{a:[0,0],b:[0,1]},edges:[['a','b',10,1,'footway',null,1]]});
+assert.equal(R.shortest(directed,'b','a'),null);
+const order=[{id:'a',name:'A',start:540,duration:30},{id:'b',name:'B',start:600,duration:30},{id:'anchor',name:'Fixed',start:660,duration:30,fixed:true}];
+const options={start:540,end:900,blocks:[{start:660,end:690}],leg:()=>({meters:65}),speed:65,service:()=>15,wait:()=>10};
+const simulated=R.simulate(order,options);assert(simulated.feasible);assert.equal(simulated.scheduled[2].start,660);assert.equal(simulated.scheduled[0].duration,30);
+assert.equal(R.optimize(order,options).order[2].id,'anchor');
+assert.equal(R.simulate(order,{...options,leg:()=>({error:'Missing route'})}).feasible,false);
+assert.equal(R.simulate(order,{...options,service:()=>100}).feasible,false);
+assert(R.simulate(order,{...options,wait:()=>null}).warnings.length);
+console.log('Pedestrian graph paths, disconnections, snapping, one-way edges, fixed anchors and optimization feasibility passed.');

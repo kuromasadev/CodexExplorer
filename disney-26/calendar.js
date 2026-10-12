@@ -2,7 +2,8 @@ let websiteActivities=[],calendarItems=[],pickedActivity=null;
 function activityCatalog() {
   const park=plan.days[day].park,choices=rows.filter(r=>r.Park===park),catalog={};
   for(const info of websiteActivities.filter(r=>r.Park===park)) {
-    const matches=choices.filter(r=>norm(r.Experience)===norm(info.Experience));const choice=matches.length===1?matches[0]:null;
+    const websiteMatch=typeof locationDocument==='undefined'?null:locationDocument?.matches.find(m=>m.park===park&&m.kind==='website'&&m.websiteId===info['Website entity ID']&&m.entityId);
+    const matches=choices.filter(r=>norm(r.Experience)===norm(info.Experience)||(websiteMatch&&locationDocument.matches.some(m=>m.park===park&&m.kind==='preference'&&m.name===r.Experience&&m.entityId===websiteMatch.entityId)));const choice=matches.length===1?matches[0]:null;
     const heightMatch=(info['Height tags']||'').match(/(\d+)-inches/);
     const key=info['Website entity ID'];
     catalog[key]={key,name:info.Experience,category:choice?category(choice):info.Summary.includes('Character')?'Character':info.Summary.includes('Show')?'Show':info.Summary.includes('Live Entertainment')?'Outside Show':/rides|spinning/i.test(info.Summary+' '+info.Tags)?'Ride':'Attraction',votes:choice?votes(choice):0,height:choice&&Number.isFinite(parseFloat(choice['Min height (in)']))?parseFloat(choice['Min height (in)']):heightMatch?+heightMatch[1]:NaN,info,choice};
@@ -79,9 +80,15 @@ function renderCalendar() {
   for(const item of calendarItems){const activity=catalog[item.activity];if(!activity){issues.push('A saved activity is no longer in the catalog.');continue;}const box=document.createElement('div');box.className='calendar-appointment';box.style.top=((item.start-480)/15*28)+'px';box.style.height=(item.duration/15*28)+'px';draggable(box,item.activity,item.id);const title=document.createElement('strong');title.textContent=`${clock(item.start)}–${clock(item.start+item.duration)} ${activity.name}`;box.append(title);const duration=document.createElement('input');duration.type='number';duration.min='15';duration.step='15';duration.value=item.duration;duration.setAttribute('aria-label',activity.name+' duration in minutes');duration.onchange=()=>commitCalendar(item.activity,item.start,item.id,+duration.value);const remove=document.createElement('button');remove.textContent='Remove';remove.onclick=()=>{calendarItems=calendarItems.filter(x=>x.id!==item.id);settings();renderSegments();};box.append(duration,remove);grid.append(box);if(constraints){try{CalendarCore.place(calendarItems,item,constraints);}catch(e){issues.push(activity.name+': '+e.message);}}}
   viewport.append(grid);layout.append(viewport);host.append(layout);library.scrollTop=viewState.cards;viewport.scrollTop=viewState.time;
   const print=document.createElement('div');print.className='calendar-print';const printed=[...calendarItems.map(x=>({start:x.start,end:x.start+x.duration,name:catalog[x.activity]?.name||'Unknown activity'})),...fixed].sort((a,b)=>a.start-b.start);for(const item of printed){const p=document.createElement('p');p.textContent=`${clock(item.start)}–${item.end?clock(item.end):'end unset'} · ${item.name}`;print.append(p);}host.append(print);
+  if(typeof syncMapCalendar==='function')syncMapCalendar();
   el('selectionStatus').textContent=issues.length?[...new Set(issues)].join(' '):'Drag a card to a time, or select a card and then select a time. Drag appointments to move them. Durations are editable estimates.';
 }
 function migrateSelections() {
   if(calendarItems.length)return;
   const catalog=activityCatalog();for(const [key,names] of Object.entries(manualSelections)){let start=+key.split('-')[0];for(const name of names){const activity=Object.values(catalog).find(a=>a.name===name);if(!activity)continue;const snapped=Math.ceil(start/15)*15,duration=estimatedDuration(activity,snapped).minutes;calendarItems.push({id:crypto.randomUUID(),activity:activity.key,start:snapped,duration});start=snapped+duration;}}
+}
+function normalizeCalendarKeys() {
+  const catalog=activityCatalog();let changed=false;
+  calendarItems=calendarItems.map(item=>{if(catalog[item.activity]||!item.activity.startsWith('choice:'))return item;const matches=Object.values(catalog).filter(a=>a.choice&&norm(a.choice.Experience)===item.activity.slice(7));if(matches.length!==1)return item;changed=true;return {...item,activity:matches[0].key};});
+  if(changed)settings();
 }
