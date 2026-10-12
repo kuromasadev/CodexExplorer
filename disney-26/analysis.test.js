@@ -1,0 +1,18 @@
+const assert=require('node:assert/strict');
+const {analyze,itinerary}=require('./analysis.js');
+const state=(time,wait,status='OPERATING')=>({time,status,queue:{STANDBY:{waitTime:wait}},changed:['status','queue.STANDBY.waitTime']});
+const documents=[{date:'2026-10-06',data:{entities:[{id:'ride',opening:{},history:[state('2026-10-06T13:00:00Z',10),state('2026-10-06T13:45:00Z',50),state('2026-10-06T14:00:00Z',50,'CLOSED')]}]}}];
+const profiles=analyze(documents,'2026-11-24');
+assert.equal(profiles.ride[0].hour,9);
+assert.equal(profiles.ride[0].median,10,'Duration weighting must favor the 45-minute state');
+assert.equal(profiles.ride[0].p90,50);
+assert.equal(profiles.ride[0].minutes,60);
+assert.deepEqual(analyze(documents,'2026-11-28'),{},'Weekend comparisons exclude weekdays');
+assert.deepEqual(analyze([{date:'2026-10-06',data:{entities:[{id:'stale',opening:{time:'2026-10-06T13:00:00Z',status:'OPERATING',queue:{STANDBY:{waitTime:10}},observedAtByKind:{'queue.STANDBY':'2026-10-01T13:00:00Z',status:'2026-10-01T13:00:00Z'}},history:[]}]}}],'2026-11-24'),{});
+const result=itinerary([{id:'ride',name:'Ride',votes:3,height:40}],profiles,{start:540,end:660,blocks:[{start:560,end:600,name:'Dinner'}],walk:10,duration:15,height:48});
+assert.equal(result.items.length,1,'Ride cannot overlap reservation or use a missing hourly estimate');
+assert.equal(result.remaining.length,1);
+const fit=itinerary([{id:'ride',name:'Ride',votes:3,height:40}],profiles,{start:540,end:660,walk:10,duration:15,height:48});
+assert.equal(fit.items[0].end,575);
+assert.equal(itinerary([{id:'ride',name:'Ride',votes:3,height:40}],profiles,{start:540,end:660,height:38}).remaining.length,1);
+console.log('History weighting, day types, stale states, reservations, duration and height checks passed.');
